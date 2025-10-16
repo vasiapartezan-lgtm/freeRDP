@@ -1,0 +1,136 @@
+name: RDP Debian 12
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-debian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Setup Debian 12 Environment
+        run: |
+          # Install necessary packages for RDP
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-goodies \
+            xorg \
+            xrdp \
+            firefox-esr \
+            file-manager \
+            terminal
+
+      - name: Configure XRDP for Debian 12
+        run: |
+          # Configure XRDP to use XFCE
+          echo 'xfce4-session' > ~/.xsession
+          sudo cp ~/.xsession /etc/skel/
+          
+          # Fix XRDP configuration for Debian 12
+          sudo sed -i 's/port=3389/port=3389\nsecurity_layer=negotiate/' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/ssl_protocols=TLSv1.2, TLSv1.3/ssl_protocols=TLSv1.2, TLSv1.3\ncrypt_level=low/' /etc/xrdp/xrdp.ini
+          
+          # Create proper session configuration
+          sudo tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+          startxfce4
+          EOF
+          
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Generate secure password
+          PASSWORD=$(openssl rand -base64 32 | tr -d '/+' | cut -c1-16)
+          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+          
+          # Create user
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:$PASSWORD" | sudo chpasswd
+          
+          # Add to necessary groups
+          sudo usermod -a -G sudo rdpuser
+          sudo usermod -a -G audio rdpuser
+          sudo usermod -a -G video rdpuser
+          
+          # Setup user environment
+          sudo -u rdpuser mkdir -p /home/rdpuser/.config/xfce4
+          sudo -u rdpuser echo 'xfce4-session' > /home/rdpuser/.xsession
+
+      - name: Install Tailscale
+        run: |
+          # Install Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # Configure Tailscale to run without service (since we're in CI)
+          sudo tailscaled --state=mem: &
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Wait for tailscaled to start
+          sleep 10
+          
+          # Bring up Tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=debian-gh-$GITHUB_RUN_ID
+          
+          # Get Tailscale IP
+          TS_IP=$(sudo tailscale ip -4)
+          if [ -z "$TS_IP" ]; then
+            echo "Failed to get Tailscale IP"
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Start and Configure RDP Service
+        run: |
+          # Stop and restart xrdp service
+          sudo systemctl stop xrdp
+          sudo systemctl stop xrdp-sesman
+          
+          # Start xrdp manually (better for CI environment)
+          sudo xrdp-sesman &
+          sudo xrdp &
+          
+          # Wait for services to start
+          sleep 5
+          
+          # Configure firewall
+          sudo ufw allow 3389
+          echo "RDP service started on port 3389"
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Testing RDP connectivity..."
+          # Install netcat for testing
+          sudo apt-get install -y netcat
+          
+          # Test port connectivity
+          if nc -z -w 5 $TAILSCALE_IP 3389; then
+            echo "✓ RDP port 3389 is accessible"
+          else
+            echo "✗ RDP port 3389 is not accessible"
+            exit 1
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== DEBIAN 12 RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdpuser"
+          echo "Password: $(echo $RDP_CREDS | cut -d'|' -f2 | cut -d':' -f2)"
+          echo "============================"
+          echo ""
+          echo "RDP session is active. Use Ctrl+C in workflow to terminate."
+          
+          # Keep the runner alive
+          while true; do
+            echo "[$(date)] RDP session active..."
+            sleep 300
+          done
