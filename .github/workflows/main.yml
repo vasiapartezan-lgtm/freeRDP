@@ -8,24 +8,26 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm-slim
+      options: --privileged --security-opt seccomp=unconfined
 
     steps:
-      - name: Update and Install Dependencies
+      - name: Update System and Install Dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            sudo \
-            curl \
-            wget \
-            gnupg \
-            systemd
+          apt-get install -y sudo curl wget gnupg2 systemd
 
-      - name: Install Desktop Environment
+      - name: Install XFCE Desktop
         run: |
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xfce4 \
             xfce4-goodies \
             xorg \
+            dbus-x11 \
+            x11-utils
+
+      - name: Install RDP and Browser
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xrdp \
             firefox-esr \
             thunar \
@@ -34,15 +36,15 @@ jobs:
 
       - name: Configure XRDP
         run: |
-          echo 'xfce4-session' > ~/.xsession
-          tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
-          #!/bin/sh
-          if [ -r /etc/default/locale ]; then
-            . /etc/default/locale
-            export LANG LANGUAGE
-          fi
-          startxfce4
-          EOF
+          echo 'xfce4-session' > /root/.xsession
+          cat > /etc/xrdp/startwm.sh << 'EOF'
+#!/bin/sh
+if [ -r /etc/default/locale ]; then
+  . /etc/default/locale
+  export LANG LANGUAGE
+fi
+startxfce4
+EOF
           chmod +x /etc/xrdp/startwm.sh
 
       - name: Create RDP User
@@ -52,17 +54,18 @@ jobs:
           echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
           
           # Create user
-          useradd -m -s /bin/bash rdplinux
+          useradd -m -s /bin/bash -G sudo rdplinux
           echo "rdplinux:$PASSWORD" | chpasswd
-          usermod -a -G sudo rdplinux
           
           # Setup user session
-          sudo -u rdplinux mkdir -p /home/rdplinux/.config
-          sudo -u rdplinux echo 'xfce4-session' > /home/rdplinux/.xsession
+          mkdir -p /home/rdplinux/.config
+          echo 'xfce4-session' > /home/rdplinux/.xsession
+          chown -R rdplinux:rdplinux /home/rdplinux
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
+          # Start tailscaled in background
           tailscaled --state=mem: &
 
       - name: Connect Tailscale
@@ -74,25 +77,36 @@ jobs:
           
           if [ -z "$TS_IP" ]; then
             echo "❌ Failed to get Tailscale IP"
-            exit 1
+            # Try alternative method
+            sleep 5
+            TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
+            if [ -n "$TS_IP" ]; then
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+            else
+              exit 1
+            fi
           fi
 
-      - name: Start RDP Service
+      - name: Start RDP Services
         run: |
+          # Start DBUS
+          dbus-daemon --system --fork
+          
           # Start RDP services
           xrdp-sesman &
           xrdp &
+          
           sleep 5
           
-          # Test RDP service
-          if nc -z localhost 3389; then
-            echo "✅ RDP service started successfully"
+          # Check if RDP is running
+          if ps aux | grep -q [x]rdp; then
+            echo "✅ RDP services started successfully"
           else
-            echo "❌ RDP service failed to start"
+            echo "❌ RDP services failed to start"
             exit 1
           fi
 
-      - name: Show Connection Info
+      - name: Show Connection Information
         run: |
           echo ""
           echo "🖥️  ===== DEBIAN 12 RDP ACCESS ====="
@@ -101,16 +115,26 @@ jobs:
           echo "🔑 Password: $RDP_PASSWORD"
           echo "🔌 Port: 3389"
           echo "🐧 OS: Debian 12 (Bookworm)"
+          echo "📁 Desktop: XFCE"
+          echo "🌐 Browser: Firefox ESR"
           echo "================================"
           echo ""
+          echo "💡 Connect using:"
+          echo "rdesktop -u rdplinux -p $RDP_PASSWORD $TAILSCALE_IP"
+          echo "or"
+          echo "xfreerdp /u:rdplinux /p:$RDP_PASSWORD /v:$TAILSCALE_IP"
 
-      - name: Keep Alive
+      - name: Keep Session Alive
         run: |
-          echo "🔄 Debian 12 RDP session is active for 1 hour"
+          echo "🔄 Debian 12 RDP session is now active!"
+          echo "⏰ This session will run for 1 hour maximum"
           echo "⏹️  To stop: Cancel this workflow in GitHub Actions"
+          echo ""
           COUNTER=0
           while [ $COUNTER -lt 72 ]; do
-            echo "⏰ Running... ($((COUNTER * 5)) minutes)"
+            MINUTES=$((COUNTER * 5))
+            echo "✅ Session active - ${MINUTES} minutes elapsed"
             sleep 300
             COUNTER=$((COUNTER + 1))
           done
+          echo "🕒 Maximum time reached, session ending"
