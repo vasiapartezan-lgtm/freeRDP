@@ -1,39 +1,41 @@
-name: RDP Debian 12
+name: Debian 12 RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-debian:
+  debian-rdp:
     runs-on: ubuntu-latest
-    timeout-minutes: 3600
+    container:
+      image: debian:bookworm-slim
 
     steps:
-      - name: Setup Debian 12 Environment
+      - name: Update and Install Dependencies
         run: |
-          # Install necessary packages for RDP
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            sudo \
+            curl \
+            wget \
+            gnupg \
+            systemd
+
+      - name: Install Desktop Environment
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xfce4 \
             xfce4-goodies \
             xorg \
             xrdp \
             firefox-esr \
-            file-manager \
-            terminal
+            thunar \
+            xfce4-terminal \
+            netcat
 
-      - name: Configure XRDP for Debian 12
+      - name: Configure XRDP
         run: |
-          # Configure XRDP to use XFCE
           echo 'xfce4-session' > ~/.xsession
-          sudo cp ~/.xsession /etc/skel/
-          
-          # Fix XRDP configuration for Debian 12
-          sudo sed -i 's/port=3389/port=3389\nsecurity_layer=negotiate/' /etc/xrdp/xrdp.ini
-          sudo sed -i 's/ssl_protocols=TLSv1.2, TLSv1.3/ssl_protocols=TLSv1.2, TLSv1.3\ncrypt_level=low/' /etc/xrdp/xrdp.ini
-          
-          # Create proper session configuration
-          sudo tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
+          tee /etc/xrdp/startwm.sh > /dev/null <<'EOF'
           #!/bin/sh
           if [ -r /etc/default/locale ]; then
             . /etc/default/locale
@@ -41,96 +43,74 @@ jobs:
           fi
           startxfce4
           EOF
-          
-          sudo chmod +x /etc/xrdp/startwm.sh
+          chmod +x /etc/xrdp/startwm.sh
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User
         run: |
           # Generate secure password
-          PASSWORD=$(openssl rand -base64 32 | tr -d '/+' | cut -c1-16)
-          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+          PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-12)
+          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
           
           # Create user
-          sudo useradd -m -s /bin/bash rdpuser
-          echo "rdpuser:$PASSWORD" | sudo chpasswd
+          useradd -m -s /bin/bash rdplinux
+          echo "rdplinux:$PASSWORD" | chpasswd
+          usermod -a -G sudo rdplinux
           
-          # Add to necessary groups
-          sudo usermod -a -G sudo rdpuser
-          sudo usermod -a -G audio rdpuser
-          sudo usermod -a -G video rdpuser
-          
-          # Setup user environment
-          sudo -u rdpuser mkdir -p /home/rdpuser/.config/xfce4
-          sudo -u rdpuser echo 'xfce4-session' > /home/rdpuser/.xsession
+          # Setup user session
+          sudo -u rdplinux mkdir -p /home/rdplinux/.config
+          sudo -u rdplinux echo 'xfce4-session' > /home/rdplinux/.xsession
 
       - name: Install Tailscale
         run: |
-          # Install Tailscale
           curl -fsSL https://tailscale.com/install.sh | sh
-          
-          # Configure Tailscale to run without service (since we're in CI)
-          sudo tailscaled --state=mem: &
+          tailscaled --state=mem: &
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale
         run: |
-          # Wait for tailscaled to start
           sleep 10
+          tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=debian12-$GITHUB_RUN_ID
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
           
-          # Bring up Tailscale
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=debian-gh-$GITHUB_RUN_ID
-          
-          # Get Tailscale IP
-          TS_IP=$(sudo tailscale ip -4)
           if [ -z "$TS_IP" ]; then
-            echo "Failed to get Tailscale IP"
+            echo "❌ Failed to get Tailscale IP"
             exit 1
           fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Start and Configure RDP Service
+      - name: Start RDP Service
         run: |
-          # Stop and restart xrdp service
-          sudo systemctl stop xrdp
-          sudo systemctl stop xrdp-sesman
-          
-          # Start xrdp manually (better for CI environment)
-          sudo xrdp-sesman &
-          sudo xrdp &
-          
-          # Wait for services to start
+          # Start RDP services
+          xrdp-sesman &
+          xrdp &
           sleep 5
           
-          # Configure firewall
-          sudo ufw allow 3389
-          echo "RDP service started on port 3389"
-
-      - name: Verify RDP Accessibility
-        run: |
-          echo "Testing RDP connectivity..."
-          # Install netcat for testing
-          sudo apt-get install -y netcat
-          
-          # Test port connectivity
-          if nc -z -w 5 $TAILSCALE_IP 3389; then
-            echo "✓ RDP port 3389 is accessible"
+          # Test RDP service
+          if nc -z localhost 3389; then
+            echo "✅ RDP service started successfully"
           else
-            echo "✗ RDP port 3389 is not accessible"
+            echo "❌ RDP service failed to start"
             exit 1
           fi
 
-      - name: Maintain Connection
+      - name: Show Connection Info
         run: |
           echo ""
-          echo "=== DEBIAN 12 RDP ACCESS ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: rdpuser"
-          echo "Password: $(echo $RDP_CREDS | cut -d'|' -f2 | cut -d':' -f2)"
-          echo "============================"
+          echo "🖥️  ===== DEBIAN 12 RDP ACCESS ====="
+          echo "📍 IP Address: $TAILSCALE_IP"
+          echo "👤 Username: rdplinux"
+          echo "🔑 Password: $RDP_PASSWORD"
+          echo "🔌 Port: 3389"
+          echo "🐧 OS: Debian 12 (Bookworm)"
+          echo "================================"
           echo ""
-          echo "RDP session is active. Use Ctrl+C in workflow to terminate."
-          
-          # Keep the runner alive
-          while true; do
-            echo "[$(date)] RDP session active..."
+
+      - name: Keep Alive
+        run: |
+          echo "🔄 Debian 12 RDP session is active for 1 hour"
+          echo "⏹️  To stop: Cancel this workflow in GitHub Actions"
+          COUNTER=0
+          while [ $COUNTER -lt 72 ]; do
+            echo "⏰ Running... ($((COUNTER * 5)) minutes)"
             sleep 300
+            COUNTER=$((COUNTER + 1))
           done
